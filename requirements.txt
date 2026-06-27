@@ -1,5 +1,6 @@
 streamlit
 openai
-requests
 python-dotenv
 tavily-python
+requests
+pytest

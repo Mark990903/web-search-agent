@@ -7,18 +7,34 @@ from datetime import datetime
 
 load_dotenv()
 
+_LOGGED_MESSAGES = set()
 
-def normalize_result(source: str, title: str, url: str, content: str, published_at: str = ""):
+
+def log_once(message: str):
+    """
+    避免未配置可选搜索源时在终端反复刷屏。
+    """
+    if message in _LOGGED_MESSAGES:
+        return
+
+    _LOGGED_MESSAGES.add(message)
+    print(message)
+
+
+def normalize_result(source: str, title: str, url: str, content: str, published_at: str = "", language: str = ""):
     """
     把不同搜索 API 返回的数据，统一成同一种格式。
     这样后面的 Agent 不需要关心结果来自 Tavily、Google 还是 NewsAPI。
     """
     return {
         "source": source,
+        "language": language or "",
         "title": title or "",
         "url": url or "",
         "content": content or "",
-        "published_at": published_at or ""
+        "published_at": published_at or "",
+        "source_id": "",
+        "domain": get_domain(url or "")
     }
 
 
@@ -29,7 +45,8 @@ def search_tavily(query: str, max_results: int = 5, language: str = "", time_ran
     api_key = os.getenv("TAVILY_API_KEY")
 
     if not api_key:
-        raise ValueError("没有找到 TAVILY_API_KEY，请检查 .env 文件")
+        log_once("未配置 TAVILY_API_KEY，跳过 Tavily 搜索")
+        return []
 
     client = TavilyClient(api_key=api_key)
 
@@ -39,7 +56,9 @@ def search_tavily(query: str, max_results: int = 5, language: str = "", time_ran
         "search_depth": "basic"
     }
 
-    if time_range:
+    if time_range and time_range.days == 1:
+        search_params["time_range"] = "day"
+    elif time_range:
         search_params["start_date"] = time_range.start_iso
         search_params["end_date"] = time_range.end_iso
 
@@ -52,7 +71,8 @@ def search_tavily(query: str, max_results: int = 5, language: str = "", time_ran
             source="tavily",
             title=item.get("title"),
             url=item.get("url"),
-            content=item.get("content")
+            content=item.get("content"),
+            language=language
         )
         for item in results
     ]
@@ -70,7 +90,7 @@ def search_google(query: str, max_results: int = 5, language: str = "", time_ran
     cse_id = os.getenv("GOOGLE_CSE_ID")
 
     if not api_key or not cse_id:
-        print("未配置 GOOGLE_API_KEY 或 GOOGLE_CSE_ID，跳过 Google 搜索")
+        log_once("未配置 GOOGLE_API_KEY 或 GOOGLE_CSE_ID，跳过 Google 搜索")
         return []
 
     url = "https://www.googleapis.com/customsearch/v1"
@@ -80,6 +100,11 @@ def search_google(query: str, max_results: int = 5, language: str = "", time_ran
         "q": query,
         "num": max_results
     }
+
+    if language == "en":
+        params["lr"] = "lang_en"
+    elif language == "zh":
+        params["lr"] = "lang_zh-CN"
 
     if time_range:
         params["dateRestrict"] = f"d{time_range.days}"
@@ -96,7 +121,8 @@ def search_google(query: str, max_results: int = 5, language: str = "", time_ran
             source="google",
             title=item.get("title"),
             url=item.get("link"),
-            content=item.get("snippet")
+            content=item.get("snippet"),
+            language=language
         )
         for item in items
     ]
@@ -112,17 +138,19 @@ def search_newsapi(query: str, max_results: int = 5, language: str = "", time_ra
     api_key = os.getenv("NEWS_API_KEY")
 
     if not api_key:
-        print("未配置 NEWS_API_KEY，跳过 NewsAPI 搜索")
+        log_once("未配置 NEWS_API_KEY，跳过 NewsAPI 搜索")
         return []
 
     url = "https://newsapi.org/v2/everything"
     params = {
         "apiKey": api_key,
         "q": query,
-        "language": "en",
         "pageSize": max_results,
         "sortBy": "relevancy"
     }
+
+    if language == "en":
+        params["language"] = "en"
 
     if time_range:
         params["from"] = time_range.start_iso
@@ -140,7 +168,8 @@ def search_newsapi(query: str, max_results: int = 5, language: str = "", time_ra
             title=item.get("title"),
             url=item.get("url"),
             content=item.get("description") or item.get("content"),
-            published_at=item.get("publishedAt")
+            published_at=item.get("publishedAt"),
+            language=language
         )
         for item in articles
     ]
@@ -214,7 +243,35 @@ def add_source_ids(results):
     return results
 
 
-def multi_source_search(query: str, max_results_per_source: int = 5, language: str = "", time_range=None):
+def get_source_config_issue(source: str):
+    """
+    返回搜索源无法启用的原因；配置完整时返回 None。
+    """
+    if source == "tavily" and not os.getenv("TAVILY_API_KEY"):
+        return "未配置 TAVILY_API_KEY"
+
+    if source == "google":
+        missing = []
+        if not os.getenv("GOOGLE_API_KEY"):
+            missing.append("GOOGLE_API_KEY")
+        if not os.getenv("GOOGLE_CSE_ID"):
+            missing.append("GOOGLE_CSE_ID")
+        if missing:
+            return "未配置 " + " 或 ".join(missing)
+
+    if source == "newsapi" and not os.getenv("NEWS_API_KEY"):
+        return "未配置 NEWS_API_KEY"
+
+    return None
+
+
+def multi_source_search(
+    query: str,
+    max_results_per_source: int = 5,
+    language: str = "",
+    time_range=None,
+    include_metadata: bool = False
+):
     """
     多来源搜索主函数。
 
@@ -228,15 +285,29 @@ def multi_source_search(query: str, max_results_per_source: int = 5, language: s
     7. 添加 source_id，方便后续引用
     """
     all_results = []
+    enabled_sources = []
+    skipped_sources = []
+    failed_sources = []
 
-    search_functions = [
-        search_tavily,
-        search_google,
-        search_newsapi,
-        search_bing
+    search_sources = [
+        ("tavily", search_tavily),
+        ("google", search_google),
+        ("newsapi", search_newsapi),
     ]
 
-    for search_function in search_functions:
+    for source_name, search_function in search_sources:
+        config_issue = get_source_config_issue(source_name)
+        if config_issue:
+            skipped_sources.append({
+                "source": source_name,
+                "language": language or "",
+                "reason": config_issue
+            })
+            log_once(f"{config_issue}，跳过 {source_name} 搜索")
+            continue
+
+        enabled_sources.append(source_name)
+
         try:
             results = search_function(
                 query,
@@ -250,10 +321,24 @@ def multi_source_search(query: str, max_results_per_source: int = 5, language: s
             ]
             all_results.extend(results)
         except Exception as error:
-            print(f"{search_function.__name__} 搜索失败：{error}")
+            message = f"{source_name} 搜索失败：{error}"
+            log_once(message)
+            failed_sources.append({
+                "source": source_name,
+                "language": language or "",
+                "reason": str(error)
+            })
 
     unique_results = deduplicate_results(all_results)
     results_with_ids = add_source_ids(unique_results)
+
+    if include_metadata:
+        return {
+            "results": results_with_ids,
+            "enabled_sources": enabled_sources,
+            "skipped_sources": skipped_sources,
+            "failed_sources": failed_sources
+        }
 
     return results_with_ids
 

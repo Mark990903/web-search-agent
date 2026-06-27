@@ -28,6 +28,25 @@ class SearchTimeFilterTests(unittest.TestCase):
         self.assertEqual(params["start_date"], "2026-06-20")
         self.assertEqual(params["end_date"], "2026-06-26")
 
+    @patch.dict("os.environ", {"TAVILY_API_KEY": "test-key"})
+    @patch("search_tool.TavilyClient")
+    def test_tavily_receives_single_day_range(self, tavily_client):
+        today_range = TimeRange(
+            label="今天",
+            start_date=date(2026, 6, 26),
+            end_date=date(2026, 6, 26),
+        )
+        client = Mock()
+        client.search.return_value = {"results": []}
+        tavily_client.return_value = client
+
+        search_tool.search_tavily("query", time_range=today_range)
+
+        params = client.search.call_args.kwargs
+        self.assertEqual(params["time_range"], "day")
+        self.assertNotIn("start_date", params)
+        self.assertNotIn("end_date", params)
+
     @patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key", "GOOGLE_CSE_ID": "test-cse"})
     @patch("search_tool.requests.get")
     def test_google_receives_date_range(self, requests_get):

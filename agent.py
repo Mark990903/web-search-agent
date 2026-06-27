@@ -1,6 +1,7 @@
 # 导入操作系统模块
 # 用于读取环境变量（.env中的配置）
 import os
+from collections import Counter
 
 # 导入 dotenv
 # 用于自动加载 .env 文件中的配置
@@ -26,9 +27,18 @@ def create_llm_client():
     创建 OFOX 的 OpenAI 兼容客户端。
     后面翻译、中文报告、英文报告都会复用这个客户端。
     """
+    api_key = os.getenv("OFOX_API_KEY")
+    base_url = os.getenv("OFOX_BASE_URL")
+
+    if not api_key:
+        raise ValueError("未配置 OFOX_API_KEY")
+
+    if not base_url:
+        raise ValueError("未配置 OFOX_BASE_URL")
+
     return OpenAI(
-        api_key=os.getenv("OFOX_API_KEY"),
-        base_url=os.getenv("OFOX_BASE_URL")
+        api_key=api_key,
+        base_url=base_url
     )
 
 
@@ -38,9 +48,13 @@ def translate_query_to_english(query: str):
     这样可以同时搜索中文互联网和英文互联网，提升资料来源多样性。
     """
     client = create_llm_client()
+    model = os.getenv("OFOX_MODEL")
+
+    if not model:
+        raise ValueError("未配置 OFOX_MODEL")
 
     response = client.chat.completions.create(
-        model=os.getenv("OFOX_MODEL"),
+        model=model,
         messages=[
             {
                 "role": "system",
@@ -108,6 +122,10 @@ def generate_report(query: str, english_query: str, context: str, report_languag
         report_language: "zh" 或 "en"
     """
     client = create_llm_client()
+    model = os.getenv("OFOX_MODEL")
+
+    if not model:
+        raise ValueError("未配置 OFOX_MODEL")
 
     if report_language == "zh":
         language_instruction = "请生成中文研究报告。"
@@ -199,7 +217,7 @@ Report format:
 """
 
     response = client.chat.completions.create(
-        model=os.getenv("OFOX_MODEL"),
+        model=model,
         messages=[
             {
                 "role": "user",
@@ -210,6 +228,50 @@ Report format:
     )
 
     return response.choices[0].message.content
+
+
+def build_source_stats(results):
+    """
+    统计最终用于报告的来源数量、搜索引擎分布和语言分布。
+    """
+    return {
+        "total_sources": len(results),
+        "by_engine": dict(Counter(item.get("source") or "unknown" for item in results)),
+        "by_language": dict(Counter(item.get("language") or "unknown" for item in results)),
+    }
+
+
+def build_error_response(query: str, english_query: str, time_range, error_message: str):
+    return {
+        "chinese": f"OFOX 模型调用失败：{error_message}",
+        "english": f"OFOX model call failed: {error_message}",
+        "english_query": english_query,
+        "time_range": time_range.to_dict() if time_range else None,
+        "sources": [],
+        "source_stats": build_source_stats([]),
+        "enabled_sources": [],
+        "skipped_sources": [],
+        "failed_sources": [],
+        "error": f"OFOX 模型调用失败：{error_message}",
+        "query": query,
+    }
+
+
+def merge_metadata(*payloads):
+    enabled_sources = []
+    skipped_sources = []
+    failed_sources = []
+
+    for payload in payloads:
+        enabled_sources.extend(payload.get("enabled_sources", []))
+        skipped_sources.extend(payload.get("skipped_sources", []))
+        failed_sources.extend(payload.get("failed_sources", []))
+
+    return {
+        "enabled_sources": sorted(set(enabled_sources)),
+        "skipped_sources": skipped_sources,
+        "failed_sources": failed_sources,
+    }
 
 
 def summarize_search(query: str):
@@ -233,31 +295,44 @@ def summarize_search(query: str):
     # -------------------------
     # 第二步：自动翻译英文搜索关键词
     # -------------------------
-    english_query = translate_query_to_english(query)
+    try:
+        english_query = translate_query_to_english(query)
+    except Exception as error:
+        return build_error_response(
+            query=query,
+            english_query="",
+            time_range=time_range,
+            error_message=str(error)
+        )
 
     # -------------------------
     # 第三步：中文搜索 + 英文搜索
     # -------------------------
-    cn_results = multi_source_search(
+    cn_search = multi_source_search(
         query,
         max_results_per_source=5,
         language="zh",
-        time_range=time_range
+        time_range=time_range,
+        include_metadata=True
     )
 
-    en_results = multi_source_search(
+    en_search = multi_source_search(
         english_query,
         max_results_per_source=5,
         language="en",
-        time_range=time_range
+        time_range=time_range,
+        include_metadata=True
     )
+
+    search_metadata = merge_metadata(cn_search, en_search)
 
     # -------------------------
     # 第三步：结果融合、去重、重新编号
     # -------------------------
-    results = cn_results + en_results
+    results = cn_search.get("results", []) + en_search.get("results", [])
     results = deduplicate_results(results)
     results = add_source_ids(results)
+    source_stats = build_source_stats(results)
 
     if not results:
         return {
@@ -265,7 +340,9 @@ def summarize_search(query: str):
             "english": "No usable search results were found. Please check your API key configuration or try another query.",
             "english_query": english_query,
             "time_range": time_range.to_dict() if time_range else None,
-            "sources": []
+            "sources": [],
+            "source_stats": source_stats,
+            **search_metadata
         }
 
     # -------------------------
@@ -276,29 +353,46 @@ def summarize_search(query: str):
     # -------------------------
     # 第五步：生成中文报告 + 英文报告
     # -------------------------
-    chinese_report = generate_report(
-        query=query,
-        english_query=english_query,
-        context=context,
-        report_language="zh",
-        time_range=time_range
-    )
+    report_errors = []
 
-    english_report = generate_report(
-        query=query,
-        english_query=english_query,
-        context=context,
-        report_language="en",
-        time_range=time_range
-    )
+    try:
+        chinese_report = generate_report(
+            query=query,
+            english_query=english_query,
+            context=context,
+            report_language="zh",
+            time_range=time_range
+        )
+    except Exception as error:
+        report_errors.append(f"中文报告生成失败：{error}")
+        chinese_report = f"OFOX 模型调用失败：{error}"
+
+    try:
+        english_report = generate_report(
+            query=query,
+            english_query=english_query,
+            context=context,
+            report_language="en",
+            time_range=time_range
+        )
+    except Exception as error:
+        report_errors.append(f"英文报告生成失败：{error}")
+        english_report = f"OFOX model call failed: {error}"
 
     # -------------------------
     # 第六步：返回结构化结果
     # -------------------------
-    return {
+    response = {
         "chinese": chinese_report,
         "english": english_report,
         "english_query": english_query,
         "time_range": time_range.to_dict() if time_range else None,
-        "sources": results
+        "sources": results,
+        "source_stats": source_stats,
+        **search_metadata
     }
+
+    if report_errors:
+        response["error"] = "；".join(report_errors)
+
+    return response
