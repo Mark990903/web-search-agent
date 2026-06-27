@@ -1,30 +1,74 @@
+import logging
 import os
+import time
+from collections.abc import Callable
+from datetime import datetime
+from typing import Any
+from urllib.parse import urlparse
+
 import requests
 from dotenv import load_dotenv
 from tavily import TavilyClient
-from urllib.parse import urlparse
-from datetime import datetime
 
 load_dotenv()
 
-_LOGGED_MESSAGES = set()
+logger = logging.getLogger(__name__)
+_LOGGED_MESSAGES: set[str] = set()
+
+SearchResult = dict[str, Any]
+SearchPayload = dict[str, Any]
+SearchFunction = Callable[..., list[SearchResult]]
 
 
-def log_once(message: str):
-    """
-    避免未配置可选搜索源时在终端反复刷屏。
+def log_once(level: int, message: str) -> None:
+    """Log the same operational message only once.
+
+    Args:
+        level: Standard logging level, such as logging.WARNING.
+        message: Message to log.
     """
     if message in _LOGGED_MESSAGES:
         return
 
     _LOGGED_MESSAGES.add(message)
-    print(message)
+    logger.log(level, message)
 
 
-def normalize_result(source: str, title: str, url: str, content: str, published_at: str = "", language: str = ""):
+def get_domain(url: str) -> str:
+    """Extract a normalized domain from a URL.
+
+    Args:
+        url: URL string.
+
+    Returns:
+        Domain without leading www, or an empty string when parsing fails.
     """
-    把不同搜索 API 返回的数据，统一成同一种格式。
-    这样后面的 Agent 不需要关心结果来自 Tavily、Google 还是 NewsAPI。
+    try:
+        return urlparse(url).netloc.replace("www.", "")
+    except Exception:
+        return ""
+
+
+def normalize_result(
+    source: str,
+    title: str | None,
+    url: str | None,
+    content: str | None,
+    published_at: str | None = "",
+    language: str = "",
+) -> SearchResult:
+    """Normalize one provider result into the shared Agent schema.
+
+    Args:
+        source: Search engine name, such as tavily, google, or newsapi.
+        title: Result title.
+        url: Result URL.
+        content: Result summary or content snippet.
+        published_at: Optional publication timestamp.
+        language: Search language label, usually zh or en.
+
+    Returns:
+        A normalized search result dictionary.
     """
     return {
         "source": source,
@@ -34,26 +78,38 @@ def normalize_result(source: str, title: str, url: str, content: str, published_
         "content": content or "",
         "published_at": published_at or "",
         "source_id": "",
-        "domain": get_domain(url or "")
+        "domain": get_domain(url or ""),
     }
 
 
-def search_tavily(query: str, max_results: int = 5, language: str = "", time_range=None):
-    """
-    Tavily 搜索：适合 Agent 使用，通常会返回更适合总结的网页摘要内容。
+def search_tavily(
+    query: str,
+    max_results: int = 5,
+    language: str = "",
+    time_range: Any = None,
+) -> list[SearchResult]:
+    """Search Tavily and return normalized results.
+
+    Args:
+        query: Search query.
+        max_results: Maximum results to request.
+        language: Search language label.
+        time_range: Optional TimeRange detected from the user query.
+
+    Returns:
+        Normalized Tavily results. Returns an empty list when not configured.
     """
     api_key = os.getenv("TAVILY_API_KEY")
 
     if not api_key:
-        log_once("未配置 TAVILY_API_KEY，跳过 Tavily 搜索")
+        log_once(logging.WARNING, "未配置 TAVILY_API_KEY，跳过 Tavily 搜索")
         return []
 
     client = TavilyClient(api_key=api_key)
-
-    search_params = {
+    search_params: dict[str, Any] = {
         "query": query,
         "max_results": max_results,
-        "search_depth": "basic"
+        "search_depth": "basic",
     }
 
     if time_range and time_range.days == 1:
@@ -63,7 +119,6 @@ def search_tavily(query: str, max_results: int = 5, language: str = "", time_ran
         search_params["end_date"] = time_range.end_iso
 
     response = client.search(**search_params)
-
     results = response.get("results", [])
 
     return [
@@ -72,49 +127,96 @@ def search_tavily(query: str, max_results: int = 5, language: str = "", time_ran
             title=item.get("title"),
             url=item.get("url"),
             content=item.get("content"),
-            language=language
+            language=language,
         )
         for item in results
     ]
 
 
-def search_google(query: str, max_results: int = 5, language: str = "", time_range=None):
+def build_serper_payload(
+    query: str,
+    max_results: int,
+    language: str,
+    time_range: Any = None,
+) -> dict[str, Any]:
+    """Build the Serper request payload for Google search.
+
+    Args:
+        query: Search query.
+        max_results: Maximum results to request.
+        language: Search language label.
+        time_range: Optional TimeRange detected from the user query.
+
+    Returns:
+        JSON payload for Serper.
     """
-    Google Custom Search 搜索。
+    search_query = query
+    if time_range:
+        search_query = (
+            f"{search_query} after:{time_range.start_iso} "
+            f"before:{time_range.end_iso}"
+        )
 
-    需要在 .env 中配置：
-    GOOGLE_API_KEY=你的 Google API Key
-    GOOGLE_CSE_ID=你的搜索引擎 ID
-    """
-    api_key = os.getenv("GOOGLE_API_KEY")
-    cse_id = os.getenv("GOOGLE_CSE_ID")
-
-    if not api_key or not cse_id:
-        log_once("未配置 GOOGLE_API_KEY 或 GOOGLE_CSE_ID，跳过 Google 搜索")
-        return []
-
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "key": api_key,
-        "cx": cse_id,
-        "q": query,
-        "num": max_results
+    payload: dict[str, Any] = {
+        "q": search_query,
+        "num": max_results,
     }
 
     if language == "en":
-        params["lr"] = "lang_en"
+        payload["hl"] = "en"
+        payload["gl"] = "us"
     elif language == "zh":
-        params["lr"] = "lang_zh-CN"
+        payload["hl"] = "zh-cn"
 
-    if time_range:
-        params["dateRestrict"] = f"d{time_range.days}"
-        params["sort"] = f"date:r:{time_range.start_iso.replace('-', '')}:{time_range.end_iso.replace('-', '')}"
+    return payload
 
-    response = requests.get(url, params=params, timeout=15)
-    response.raise_for_status()
+
+def search_google(
+    query: str,
+    max_results: int = 5,
+    language: str = "",
+    time_range: Any = None,
+) -> list[SearchResult]:
+    """Search Google through the configured provider.
+
+    The current implementation uses Serper API as the Google search provider.
+
+    Args:
+        query: Search query.
+        max_results: Maximum results to request.
+        language: Search language label.
+        time_range: Optional TimeRange detected from the user query.
+
+    Returns:
+        Normalized Google results. Returns an empty list when not configured.
+    """
+    api_key = os.getenv("SERPER_API_KEY")
+
+    if not api_key:
+        log_once(logging.WARNING, "未配置 SERPER_API_KEY，跳过 Google/Serper 搜索")
+        return []
+
+    url = "https://google.serper.dev/search"
+    headers = {
+        "X-API-KEY": api_key,
+        "Content-Type": "application/json",
+    }
+    payload = build_serper_payload(
+        query=query,
+        max_results=max_results,
+        language=language,
+        time_range=time_range,
+    )
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as error:
+        log_once(logging.ERROR, f"Google/Serper 搜索失败：{error}")
+        return []
 
     data = response.json()
-    items = data.get("items", [])
+    items = data.get("organic", [])
 
     return [
         normalize_result(
@@ -122,31 +224,42 @@ def search_google(query: str, max_results: int = 5, language: str = "", time_ran
             title=item.get("title"),
             url=item.get("link"),
             content=item.get("snippet"),
-            language=language
+            language=language,
         )
         for item in items
     ]
 
 
-def search_newsapi(query: str, max_results: int = 5, language: str = "", time_range=None):
-    """
-    NewsAPI 搜索：适合搜索新闻、热点、近期事件。
+def search_newsapi(
+    query: str,
+    max_results: int = 5,
+    language: str = "",
+    time_range: Any = None,
+) -> list[SearchResult]:
+    """Search NewsAPI and return normalized results.
 
-    需要在 .env 中配置：
-    NEWS_API_KEY=你的 NewsAPI Key
+    Args:
+        query: Search query.
+        max_results: Maximum results to request.
+        language: Search language label. English searches pass language="en";
+            Chinese searches intentionally do not force language="zh".
+        time_range: Optional TimeRange detected from the user query.
+
+    Returns:
+        Normalized NewsAPI results. Returns an empty list when not configured.
     """
     api_key = os.getenv("NEWS_API_KEY")
 
     if not api_key:
-        log_once("未配置 NEWS_API_KEY，跳过 NewsAPI 搜索")
+        log_once(logging.WARNING, "未配置 NEWS_API_KEY，跳过 NewsAPI 搜索")
         return []
 
     url = "https://newsapi.org/v2/everything"
-    params = {
+    params: dict[str, Any] = {
         "apiKey": api_key,
         "q": query,
         "pageSize": max_results,
-        "sortBy": "relevancy"
+        "sortBy": "relevancy",
     }
 
     if language == "en":
@@ -169,24 +282,41 @@ def search_newsapi(query: str, max_results: int = 5, language: str = "", time_ra
             url=item.get("url"),
             content=item.get("description") or item.get("content"),
             published_at=item.get("publishedAt"),
-            language=language
+            language=language,
         )
         for item in articles
     ]
 
 
-def search_bing(query: str, max_results: int = 5, language: str = "", time_range=None):
-    """
-    Bing 搜索预留接口。
-    目前先不接入，避免第一版卡在 Azure/Bing 配置上。
+def search_bing(
+    query: str,
+    max_results: int = 5,
+    language: str = "",
+    time_range: Any = None,
+) -> list[SearchResult]:
+    """Reserved Bing search adapter.
+
+    Args:
+        query: Search query.
+        max_results: Maximum results to request.
+        language: Search language label.
+        time_range: Optional TimeRange detected from the user query.
+
+    Returns:
+        Empty list because Bing is not enabled in V2.2.
     """
     return []
 
 
-def is_within_time_range(published_at: str, time_range):
-    """
-    对带发布时间的结果做兜底过滤。
-    没有发布时间的通用网页结果保留，因为 Google/Tavily 已在 API 层过滤。
+def is_within_time_range(published_at: str, time_range: Any) -> bool:
+    """Return whether a result timestamp is inside the requested range.
+
+    Args:
+        published_at: Publication timestamp from a search provider.
+        time_range: Optional TimeRange detected from the user query.
+
+    Returns:
+        True when the result is in range or cannot be safely filtered.
     """
     if not time_range or not published_at:
         return True
@@ -201,20 +331,14 @@ def is_within_time_range(published_at: str, time_range):
     return time_range.start_date <= published_date <= time_range.end_date
 
 
-def get_domain(url: str):
-    """
-    从 URL 中提取域名，用于去重。
-    """
-    try:
-        return urlparse(url).netloc.replace("www.", "")
-    except Exception:
-        return ""
+def deduplicate_results(results: list[SearchResult]) -> list[SearchResult]:
+    """Deduplicate normalized results by URL while preserving order.
 
+    Args:
+        results: Normalized result list.
 
-def deduplicate_results(results):
-    """
-    根据 URL 去重。
-    如果 URL 完全相同，只保留第一次出现的结果。
+    Returns:
+        Deduplicated result list.
     """
     seen_urls = set()
     unique_results = []
@@ -231,10 +355,14 @@ def deduplicate_results(results):
     return unique_results
 
 
-def add_source_ids(results):
-    """
-    给每条搜索结果添加引用编号。
-    后面 AI 总结时可以使用 [1]、[2]、[3] 这样的来源引用。
+def add_source_ids(results: list[SearchResult]) -> list[SearchResult]:
+    """Add stable source IDs and domains to search results.
+
+    Args:
+        results: Normalized result list.
+
+    Returns:
+        The same list with source_id and domain populated.
     """
     for index, item in enumerate(results, start=1):
         item["source_id"] = index
@@ -243,21 +371,32 @@ def add_source_ids(results):
     return results
 
 
-def get_source_config_issue(source: str):
+def merge_results(results: list[SearchResult]) -> list[SearchResult]:
+    """Merge, deduplicate, and number normalized results.
+
+    Args:
+        results: Result list from one or more search providers.
+
+    Returns:
+        Deduplicated results with source IDs.
     """
-    返回搜索源无法启用的原因；配置完整时返回 None。
+    return add_source_ids(deduplicate_results(results))
+
+
+def get_source_config_issue(source: str) -> str | None:
+    """Return a human-readable configuration issue for a source.
+
+    Args:
+        source: Search source name.
+
+    Returns:
+        Reason text when the source is not configured, otherwise None.
     """
     if source == "tavily" and not os.getenv("TAVILY_API_KEY"):
         return "未配置 TAVILY_API_KEY"
 
-    if source == "google":
-        missing = []
-        if not os.getenv("GOOGLE_API_KEY"):
-            missing.append("GOOGLE_API_KEY")
-        if not os.getenv("GOOGLE_CSE_ID"):
-            missing.append("GOOGLE_CSE_ID")
-        if missing:
-            return "未配置 " + " 或 ".join(missing)
+    if source == "google" and not os.getenv("SERPER_API_KEY"):
+        return "未配置 SERPER_API_KEY"
 
     if source == "newsapi" and not os.getenv("NEWS_API_KEY"):
         return "未配置 NEWS_API_KEY"
@@ -269,27 +408,31 @@ def multi_source_search(
     query: str,
     max_results_per_source: int = 5,
     language: str = "",
-    time_range=None,
-    include_metadata: bool = False
-):
-    """
-    多来源搜索主函数。
+    time_range: Any = None,
+    include_metadata: bool = False,
+) -> list[SearchResult] | SearchPayload:
+    """Run all configured search providers and merge their results.
 
-    工作流程：
-    1. 调用 Tavily
-    2. 调用 Google
-    3. 调用 NewsAPI
-    4. 预留 Bing
-    5. 合并搜索结果
-    6. 去重
-    7. 添加 source_id，方便后续引用
-    """
-    all_results = []
-    enabled_sources = []
-    skipped_sources = []
-    failed_sources = []
+    Args:
+        query: Search query.
+        max_results_per_source: Maximum result count for each provider.
+        language: Search language label.
+        time_range: Optional TimeRange detected from the user query.
+        include_metadata: Whether to return enabled/skipped/failed sources.
 
-    search_sources = [
+    Returns:
+        A result list by default. When include_metadata is True, returns a
+        payload containing results and source status metadata.
+    """
+    start_time = time.perf_counter()
+    logger.info("开始搜索 query=%s language=%s", query, language or "unknown")
+
+    all_results: list[SearchResult] = []
+    enabled_sources: list[str] = []
+    skipped_sources: list[dict[str, str]] = []
+    failed_sources: list[dict[str, str]] = []
+
+    search_sources: list[tuple[str, SearchFunction]] = [
         ("tavily", search_tavily),
         ("google", search_google),
         ("newsapi", search_newsapi),
@@ -298,12 +441,14 @@ def multi_source_search(
     for source_name, search_function in search_sources:
         config_issue = get_source_config_issue(source_name)
         if config_issue:
-            skipped_sources.append({
-                "source": source_name,
-                "language": language or "",
-                "reason": config_issue
-            })
-            log_once(f"{config_issue}，跳过 {source_name} 搜索")
+            skipped_sources.append(
+                {
+                    "source": source_name,
+                    "language": language or "",
+                    "reason": config_issue,
+                }
+            )
+            log_once(logging.WARNING, f"{config_issue}，跳过 {source_name} 搜索")
             continue
 
         enabled_sources.append(source_name)
@@ -313,36 +458,46 @@ def multi_source_search(
                 query,
                 max_results=max_results_per_source,
                 language=language,
-                time_range=time_range
+                time_range=time_range,
             )
-            results = [
-                item for item in results
+            filtered_results = [
+                item
+                for item in results
                 if is_within_time_range(item.get("published_at", ""), time_range)
             ]
-            all_results.extend(results)
+            all_results.extend(filtered_results)
         except Exception as error:
             message = f"{source_name} 搜索失败：{error}"
-            log_once(message)
-            failed_sources.append({
-                "source": source_name,
-                "language": language or "",
-                "reason": str(error)
-            })
+            log_once(logging.ERROR, message)
+            failed_sources.append(
+                {
+                    "source": source_name,
+                    "language": language or "",
+                    "reason": str(error),
+                }
+            )
 
-    unique_results = deduplicate_results(all_results)
-    results_with_ids = add_source_ids(unique_results)
+    results_with_ids = merge_results(all_results)
+    elapsed = time.perf_counter() - start_time
+    logger.info(
+        "搜索完成 query=%s language=%s results=%s elapsed=%.2fs",
+        query,
+        language or "unknown",
+        len(results_with_ids),
+        elapsed,
+    )
 
     if include_metadata:
         return {
             "results": results_with_ids,
             "enabled_sources": enabled_sources,
             "skipped_sources": skipped_sources,
-            "failed_sources": failed_sources
+            "failed_sources": failed_sources,
         }
 
     return results_with_ids
 
 
-# 保留旧函数名，避免 app.py 或 agent.py 里原来的代码立刻报错。
-def search_web(query: str, max_results: int = 5):
+def search_web(query: str, max_results: int = 5) -> list[SearchResult]:
+    """Backward-compatible wrapper for Tavily search."""
     return search_tavily(query, max_results=max_results)

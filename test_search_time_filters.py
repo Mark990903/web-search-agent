@@ -47,18 +47,20 @@ class SearchTimeFilterTests(unittest.TestCase):
         self.assertNotIn("start_date", params)
         self.assertNotIn("end_date", params)
 
-    @patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key", "GOOGLE_CSE_ID": "test-cse"})
-    @patch("search_tool.requests.get")
-    def test_google_receives_date_range(self, requests_get):
+    @patch.dict("os.environ", {"SERPER_API_KEY": "test-key"})
+    @patch("search_tool.requests.post")
+    def test_google_receives_date_range(self, requests_post):
         response = Mock()
-        response.json.return_value = {"items": []}
-        requests_get.return_value = response
+        response.json.return_value = {"organic": []}
+        requests_post.return_value = response
 
         search_tool.search_google("query", time_range=self.time_range)
 
-        params = requests_get.call_args.kwargs["params"]
-        self.assertEqual(params["dateRestrict"], "d7")
-        self.assertEqual(params["sort"], "date:r:20260620:20260626")
+        payload = requests_post.call_args.kwargs["json"]
+        self.assertEqual(
+            payload["q"],
+            "query after:2026-06-20 before:2026-06-26",
+        )
 
     @patch.dict("os.environ", {"NEWS_API_KEY": "test-key"})
     @patch("search_tool.requests.get")

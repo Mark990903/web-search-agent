@@ -4,9 +4,12 @@ from datetime import date, datetime, timedelta
 
 @dataclass(frozen=True)
 class TimeRange:
-    """
-    表示用户查询中识别出的时间范围。
-    start_date 和 end_date 都是闭区间日期。
+    """Date range detected from a user query.
+
+    Attributes:
+        label: Human-readable range label.
+        start_date: Inclusive start date.
+        end_date: Inclusive end date.
     """
 
     label: str
@@ -14,18 +17,22 @@ class TimeRange:
     end_date: date
 
     @property
-    def start_iso(self):
+    def start_iso(self) -> str:
+        """Return the inclusive start date in ISO format."""
         return self.start_date.isoformat()
 
     @property
-    def end_iso(self):
+    def end_iso(self) -> str:
+        """Return the inclusive end date in ISO format."""
         return self.end_date.isoformat()
 
     @property
-    def days(self):
+    def days(self) -> int:
+        """Return the inclusive day count for this range."""
         return (self.end_date - self.start_date).days + 1
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, str | int]:
+        """Convert the time range into a Streamlit-friendly dictionary."""
         return {
             "label": self.label,
             "start_date": self.start_iso,
@@ -34,15 +41,15 @@ class TimeRange:
         }
 
 
-def detect_time_range(query: str, today: date | None = None):
-    """
-    从用户 query 中识别常见相对时间表达。
+def detect_time_range(query: str, today: date | None = None) -> TimeRange | None:
+    """Detect common relative time expressions in a query.
 
-    当前 v2.2 覆盖：
-    - 今天 / 今日 / today
-    - 最近 / 近期 / lately / recent / recently
-    - 本周 / 这周 / this week
-    - 本月 / 这个月 / this month
+    Args:
+        query: User query text.
+        today: Optional fixed date for deterministic tests.
+
+    Returns:
+        A TimeRange when a supported expression is detected, otherwise None.
     """
     if today is None:
         today = datetime.now().date()
@@ -60,13 +67,24 @@ def detect_time_range(query: str, today: date | None = None):
         start_of_month = today.replace(day=1)
         return TimeRange("本月", start_of_month, today)
 
-    if any(keyword in normalized for keyword in ["最近", "近期", "recently", "recent", "lately"]):
+    if any(
+        keyword in normalized
+        for keyword in ["最近", "近期", "recently", "recent", "lately"]
+    ):
         return TimeRange("最近7天", today - timedelta(days=6), today)
 
     return None
 
 
-def describe_time_range(time_range: TimeRange | None):
+def describe_time_range(time_range: TimeRange | None) -> str:
+    """Describe a detected time range for prompt context.
+
+    Args:
+        time_range: Optional detected TimeRange.
+
+    Returns:
+        Human-readable time range description.
+    """
     if not time_range:
         return "未识别到明确时间范围"
 
