@@ -2,6 +2,7 @@
 # 用于读取环境变量（.env中的配置）
 import logging
 import os
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -18,6 +19,7 @@ from openai import OpenAI
 # multi_source_search() 会同时调用 Tavily、Google、NewsAPI 等搜索来源
 from search_tool import merge_results, multi_source_search
 from time_awareness import detect_time_range, describe_time_range
+from query_planner import plan_queries
 
 
 # 加载 .env 文件
@@ -265,6 +267,99 @@ Report format:
     return response.choices[0].message.content
 
 
+def generate_research_report(
+    query: str,
+    planner_result: dict[str, Any],
+    context: str,
+    time_range: Any = None,
+) -> str:
+    """Generate a V3 research report for planned multi-query searches."""
+    client = create_llm_client()
+    model = os.getenv("OFOX_MODEL")
+
+    if not model:
+        raise ValueError("未配置 OFOX_MODEL")
+
+    time_range_description = describe_time_range(time_range)
+    sub_query_lines = "\n".join(
+        (
+            f"{index}. {item.get('title', '')}\n"
+            f"   - 中文查询：{item.get('query_zh', '')}\n"
+            f"   - English query: {item.get('query_en', '')}\n"
+            f"   - 目的：{item.get('purpose', '')}"
+        )
+        for index, item in enumerate(planner_result.get("sub_queries", []), start=1)
+    )
+
+    prompt = f"""
+You are Web Search Agent V3. You synthesize bilingual, multi-source search results into a Chinese research report.
+
+Original user query:
+{query}
+
+Main research topic:
+{planner_result.get("main_topic", query)}
+
+Detected time range:
+{time_range_description}
+
+Query plan:
+{sub_query_lines}
+
+Search materials from Tavily, Google, NewsAPI and other sources:
+{context}
+
+请生成中文研究报告。
+
+Rules:
+1. Do not make up information that is not supported by the search materials.
+2. Important conclusions must include source citations such as [1], [2], or [1][3].
+3. If multiple sources support the same conclusion, cite multiple sources.
+4. If sources conflict, point this out clearly.
+5. Use the same source IDs provided in the search materials.
+6. If a detected time range is provided, only use materials that match that time range and mention the time range in the report.
+7. 按子问题组织“分主题分析”，并尽量对应 Query Planner 的拆解。
+8. 不要输出英文报告。
+
+Report format:
+
+# Web Search Agent V3 Research Report
+
+## 1. 研究主题
+
+## 2. 查询规划
+列出 Agent 自动拆解出的子问题。
+
+## 3. 核心结论
+
+## 4. 分主题分析
+按照每个子问题分别分析。
+
+## 5. 多来源交叉验证
+
+## 6. 信息缺口与不确定性
+
+## 7. 参考来源
+按照下面格式列出所有使用到的来源：
+[来源编号] 标题 - 链接
+
+## 8. 后续研究建议
+"""
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        temperature=0.3,
+    )
+
+    return response.choices[0].message.content
+
+
 def build_source_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     """Build source statistics for the Streamlit UI.
 
@@ -346,6 +441,7 @@ def run_bilingual_search(
     query: str,
     english_query: str,
     time_range: Any,
+    max_results_per_source: int = 5,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run Chinese and English searches concurrently.
 
@@ -361,7 +457,7 @@ def run_bilingual_search(
         cn_future = executor.submit(
             multi_source_search,
             query,
-            max_results_per_source=5,
+            max_results_per_source=max_results_per_source,
             language="zh",
             time_range=time_range,
             include_metadata=True,
@@ -369,7 +465,7 @@ def run_bilingual_search(
         en_future = executor.submit(
             multi_source_search,
             english_query,
-            max_results_per_source=5,
+            max_results_per_source=max_results_per_source,
             language="en",
             time_range=time_range,
             include_metadata=True,
@@ -378,35 +474,231 @@ def run_bilingual_search(
         return cn_future.result(), en_future.result()
 
 
-def summarize_search(query: str) -> dict[str, Any]:
+def build_planner_metadata(
+    enabled: bool,
+    planner_result: dict[str, Any] | None = None,
+    planner_error: str | None = None,
+) -> dict[str, Any]:
+    """Build planner metadata returned to the UI and tests."""
+    planner_result = planner_result or {
+        "is_research_task": False,
+        "main_topic": "",
+        "sub_queries": [],
+        "json_parse_success": False,
+    }
+    metadata = {
+        "planner": {
+            "enabled": enabled,
+            "is_research_task": bool(planner_result.get("is_research_task")),
+            "main_topic": planner_result.get("main_topic", ""),
+            "sub_queries": planner_result.get("sub_queries", []),
+            "json_parse_success": bool(planner_result.get("json_parse_success")),
+        }
+    }
+
+    error = planner_error or planner_result.get("planner_error")
+    if error:
+        metadata["planner"]["planner_error"] = error
+        metadata["planner_error"] = error
+
+    return metadata
+
+
+def add_planner_failed_source(
+    search_metadata: dict[str, Any],
+    planner_error: str | None,
+) -> dict[str, Any]:
+    """Attach planner failure to failed_sources without hiding search results."""
+    if not planner_error:
+        return search_metadata
+
+    updated_metadata = {
+        "enabled_sources": search_metadata.get("enabled_sources", []),
+        "skipped_sources": search_metadata.get("skipped_sources", []),
+        "failed_sources": list(search_metadata.get("failed_sources", [])),
+    }
+    updated_metadata["failed_sources"].append(
+        {
+            "source": "query_planner",
+            "language": "",
+            "reason": planner_error,
+        }
+    )
+    return updated_metadata
+
+
+def run_planned_subquery_searches(
+    sub_queries: list[dict[str, Any]],
+    time_range: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run bilingual multi-source searches for planned sub-queries."""
+    all_results: list[dict[str, Any]] = []
+    payloads: list[dict[str, Any]] = []
+
+    for index, sub_query in enumerate(sub_queries[:5], start=1):
+        start_time = time.perf_counter()
+        title = sub_query.get("title", f"子问题 {index}")
+        query_zh = sub_query.get("query_zh", "")
+        query_en = sub_query.get("query_en", query_zh)
+
+        cn_search, en_search = run_bilingual_search(
+            query=query_zh,
+            english_query=query_en,
+            time_range=time_range,
+            max_results_per_source=3,
+        )
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            "Query Planner sub-query search completed index=%s title=%s "
+            "elapsed=%.2fs",
+            index,
+            title,
+            elapsed,
+        )
+
+        payloads.extend([cn_search, en_search])
+        for item in cn_search.get("results", []):
+            item["sub_query_index"] = index
+            item["sub_query_title"] = title
+            all_results.append(item)
+        for item in en_search.get("results", []):
+            item["sub_query_index"] = index
+            item["sub_query_title"] = title
+            all_results.append(item)
+
+    return all_results, merge_metadata(*payloads)
+
+
+def summarize_search(query: str, use_planner: bool = True) -> dict[str, Any]:
     """Run the full bilingual search and report workflow.
 
     Args:
         query: User query.
+        use_planner: Whether to enable the optional V3 Query Planner.
 
     Returns:
         Streamlit-ready response payload containing bilingual reports, source
         status metadata, source statistics, and final sources.
     """
 
-    # -------------------------
-    # 第一步：识别用户是否提出相对时间范围
-    # -------------------------
+    logger.info("Query Planner enabled=%s", use_planner)
+
     time_range = detect_time_range(query)
+    planner_result: dict[str, Any] | None = None
+    planner_error: str | None = None
+
+    if use_planner:
+        try:
+            planner_result = plan_queries(query)
+            planner_error = planner_result.get("planner_error")
+            logger.info(
+                "Query Planner result is_research_task=%s sub_query_count=%s "
+                "json_parse_success=%s",
+                planner_result.get("is_research_task"),
+                len(planner_result.get("sub_queries", [])),
+                planner_result.get("json_parse_success"),
+            )
+        except Exception as error:
+            planner_error = str(error)
+            planner_result = {
+                "is_research_task": False,
+                "main_topic": query,
+                "sub_queries": [],
+                "json_parse_success": False,
+                "planner_error": planner_error,
+            }
+            logger.warning("Query Planner failed before fallback: %s", error)
+    else:
+        planner_result = {
+            "is_research_task": False,
+            "main_topic": query,
+            "sub_queries": [],
+            "json_parse_success": False,
+        }
+
+    planner_metadata = build_planner_metadata(
+        enabled=use_planner,
+        planner_result=planner_result,
+        planner_error=planner_error,
+    )
+
+    if planner_result and planner_result.get("is_research_task"):
+        sub_queries = planner_result.get("sub_queries", [])[:5]
+        english_query = "；".join(
+            item.get("query_en", "") for item in sub_queries if item.get("query_en")
+        )
+        search_results, search_metadata = run_planned_subquery_searches(
+            sub_queries=sub_queries,
+            time_range=time_range,
+        )
+        search_metadata = add_planner_failed_source(search_metadata, planner_error)
+        results = merge_results(search_results)
+        source_stats = build_source_stats(results)
+
+        if not results:
+            return {
+                "chinese": (
+                    "没有搜索到可用结果，请检查 API Key 配置或更换搜索关键词。"
+                ),
+                "english": (
+                    "No usable search results were found. Please check your API "
+                    "key configuration or try another query."
+                ),
+                "english_query": english_query,
+                "time_range": time_range.to_dict() if time_range else None,
+                "sources": [],
+                "source_stats": source_stats,
+                **search_metadata,
+                **planner_metadata,
+            }
+
+        context = build_context(results)
+        report_errors = []
+
+        try:
+            chinese_report = generate_research_report(
+                query=query,
+                planner_result=planner_result,
+                context=context,
+                time_range=time_range,
+            )
+        except Exception as error:
+            logger.error("LLM 调用失败：%s", error)
+            report_errors.append(f"中文报告生成失败：{error}")
+            chinese_report = f"OFOX 模型调用失败：{error}"
+
+        response = {
+            "chinese": chinese_report,
+            "english": ENGLISH_REPORT_PLACEHOLDER,
+            "english_query": english_query,
+            "time_range": time_range.to_dict() if time_range else None,
+            "sources": results,
+            "source_stats": source_stats,
+            "english_report_available": False,
+            **search_metadata,
+            **planner_metadata,
+        }
+
+        if report_errors:
+            response["error"] = "；".join(report_errors)
+
+        return response
 
     # -------------------------
-    # 第二步：自动翻译英文搜索关键词
+    # 普通搜索路径：保持 V2.2 稳定流程
     # -------------------------
     try:
         english_query = translate_query_to_english(query)
     except Exception as error:
         logger.error("LLM 调用失败：%s", error)
-        return build_error_response(
+        response = build_error_response(
             query=query,
             english_query="",
             time_range=time_range,
             error_message=str(error),
         )
+        response.update(planner_metadata)
+        return response
 
     # -------------------------
     # 第三步：中文搜索 + 英文搜索
@@ -418,6 +710,7 @@ def summarize_search(query: str) -> dict[str, Any]:
     )
 
     search_metadata = merge_metadata(cn_search, en_search)
+    search_metadata = add_planner_failed_source(search_metadata, planner_error)
 
     # -------------------------
     # 第三步：结果融合、去重、重新编号
@@ -441,6 +734,7 @@ def summarize_search(query: str) -> dict[str, Any]:
             "sources": [],
             "source_stats": source_stats,
             **search_metadata,
+            **planner_metadata,
         }
 
     # -------------------------
@@ -480,6 +774,7 @@ def summarize_search(query: str) -> dict[str, Any]:
         "source_stats": source_stats,
         "english_report_available": False,
         **search_metadata,
+        **planner_metadata,
     }
 
     if report_errors:

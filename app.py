@@ -70,9 +70,41 @@ def display_source_status(report: dict[str, Any]) -> None:
     col_language.json(source_stats.get("by_language", {}))
 
 
+def display_query_planner(report: dict[str, Any]) -> None:
+    """Display optional Query Planner metadata without taking over the page."""
+    planner = report.get("planner", {})
+
+    with st.expander("Query Planner", expanded=False):
+        if not planner.get("enabled"):
+            st.write("Query Planner：未启用")
+            return
+
+        planner_error = planner.get("planner_error") or report.get("planner_error")
+        if planner_error:
+            st.warning("Query Planner 失败，已回退到普通搜索。")
+            st.caption(planner_error)
+
+        if planner.get("is_research_task"):
+            st.write("Planner 判断结果：研究任务")
+            sub_query_rows = [
+                {
+                    "title": item.get("title", ""),
+                    "query_zh": item.get("query_zh", ""),
+                    "query_en": item.get("query_en", ""),
+                    "purpose": item.get("purpose", ""),
+                }
+                for item in planner.get("sub_queries", [])
+            ]
+            if sub_query_rows:
+                st.dataframe(sub_query_rows, width="stretch")
+        else:
+            st.write("Planner 判断结果：普通搜索")
+
+
 # 输入框
 # 用户输入想搜索的话题
 query = st.text_input("请输入搜索主题")
+use_planner = st.checkbox("启用 Query Planner", value=True)
 
 
 # 点击按钮后执行
@@ -95,7 +127,7 @@ if st.button("开始搜索"):
         with st.spinner("Agent 正在进行中英文双语搜索并生成报告..."):
 
             try:
-                report = summarize_search(query)
+                report = summarize_search(query, use_planner=use_planner)
             except Exception as error:
                 report = {
                     "chinese": f"Agent 运行失败：{error}",
@@ -111,6 +143,14 @@ if st.button("开始搜索"):
                     "enabled_sources": [],
                     "skipped_sources": [],
                     "failed_sources": [],
+                    "planner": {
+                        "enabled": use_planner,
+                        "is_research_task": False,
+                        "main_topic": query,
+                        "sub_queries": [],
+                        "planner_error": str(error),
+                    },
+                    "planner_error": str(error),
                     "error": str(error),
                 }
                 logger.error("Agent 运行失败：%s", error)
@@ -128,6 +168,7 @@ if st.button("开始搜索"):
                 f"（{time_range['start_date']} 至 {time_range['end_date']}）"
             )
 
+        display_query_planner(report)
         display_source_status(report)
 
         if report.get("error"):
