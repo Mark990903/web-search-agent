@@ -84,6 +84,18 @@ Planner 输出示例：
 
 如果 Planner 调用失败或模型返回格式错误，系统会自动回退到 V2.2 普通搜索，并在页面的 `Query Planner` 折叠面板中显示失败提示。
 
+## V3.1 Automatic Citation Pipeline
+
+Automatic Citation Pipeline 是后台质量控制模块，不会在页面中显示额外的 Citation Check 面板。报告生成完成后，系统会自动处理引用编号：
+
+- 自动校验报告中的 `[1]`、`[2]` 等引用编号。
+- 删除不存在于搜索来源列表中的无效引用。
+- 将有效引用转换为标准 Markdown 链接，例如 `[[1]](https://example.com)`。
+- 用户在报告正文中点击 `[1]` 可以跳转到对应来源网页。
+- 参考来源章节保持整洁，继续展示 source_id、标题和 URL。
+
+页面仍然使用 `st.markdown()` 渲染报告，不使用 HTML 或 `unsafe_allow_html`。
+
 ## 运行截图位置
 
 运行截图建议放在：
@@ -147,9 +159,11 @@ streamlit run app.py
 app.py                    Streamlit 页面入口
 agent.py                  Agent 主流程、双语搜索、报告生成、来源统计
 query_planner.py          V3.0 Query Planner、JSON 解析和兜底逻辑
+citation_pipeline.py      V3.1 引用校验、清理和 Markdown 链接转换
 search_tool.py            Tavily、Google、NewsAPI 搜索适配和结果合并
 time_awareness.py         时间范围识别
 requirements.txt          Python 依赖
+test_citation_pipeline.py Citation Pipeline 单元测试
 test_query_planner.py     Query Planner 和 Planner 集成测试
 test_search.py            Agent 层测试
 test_search_tool.py       搜索层测试
@@ -161,6 +175,6 @@ docs/screenshots/         运行截图目录
 ## 测试
 
 ```bash
-python -m py_compile app.py agent.py search_tool.py time_awareness.py query_planner.py
+python -m py_compile app.py agent.py search_tool.py time_awareness.py query_planner.py citation_pipeline.py
 pytest
 ```

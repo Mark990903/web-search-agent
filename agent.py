@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 # 虽然这里连接的是 OFOX 接口，但 OFOX 提供的是 OpenAI 兼容格式
 from openai import OpenAI
 
+from citation_pipeline import process_report_citations
 # 导入我们自己编写的多来源搜索工具
 # multi_source_search() 会同时调用 Tavily、Google、NewsAPI 等搜索来源
 from search_tool import merge_results, multi_source_search
@@ -245,6 +246,12 @@ Rules:
 6. Use the same source IDs provided in the search materials.
 7. If a detected time range is provided, only use materials that match that time range and mention the time range in the report.
 8. Do not use older background knowledge as evidence for time-sensitive claims.
+9. Every core conclusion must include at least one source ID.
+10. Only cite source IDs that appear in the provided search materials.
+11. Do not invent source IDs or use citations that are not provided.
+12. Do not write URLs in the report body. Keep URLs only in the references section.
+13. The references section must keep source_id, title, and URL.
+14. Citation format must be [1], [2], or [1][2]. Do not use footnotes or any other citation format.
 
 Report format:
 
@@ -320,6 +327,12 @@ Rules:
 6. If a detected time range is provided, only use materials that match that time range and mention the time range in the report.
 7. 按子问题组织“分主题分析”，并尽量对应 Query Planner 的拆解。
 8. 不要输出英文报告。
+9. 每个核心结论必须带至少一个来源编号。
+10. 只能引用搜索材料中提供的 source_id。
+11. 不允许创造不存在的引用编号。
+12. 正文中不要写 URL，URL 只保留在参考来源部分。
+13. 参考来源部分必须保留 source_id、标题和 URL。
+14. 引用格式必须使用 [1]、[2] 或 [1][2]，不要使用脚注或其他格式。
 
 Report format:
 
@@ -656,12 +669,13 @@ def summarize_search(query: str, use_planner: bool = True) -> dict[str, Any]:
         report_errors = []
 
         try:
-            chinese_report = generate_research_report(
+            raw_chinese_report = generate_research_report(
                 query=query,
                 planner_result=planner_result,
                 context=context,
                 time_range=time_range,
             )
+            chinese_report = process_report_citations(raw_chinese_report, results)
         except Exception as error:
             logger.error("LLM 调用失败：%s", error)
             report_errors.append(f"中文报告生成失败：{error}")
@@ -748,13 +762,14 @@ def summarize_search(query: str, use_planner: bool = True) -> dict[str, Any]:
     report_errors = []
 
     try:
-        chinese_report = generate_report(
+        raw_chinese_report = generate_report(
             query=query,
             english_query=english_query,
             context=context,
             report_language="zh",
             time_range=time_range,
         )
+        chinese_report = process_report_citations(raw_chinese_report, results)
     except Exception as error:
         logger.error("LLM 调用失败：%s", error)
         report_errors.append(f"中文报告生成失败：{error}")

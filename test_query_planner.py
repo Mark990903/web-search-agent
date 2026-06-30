@@ -108,6 +108,47 @@ class QueryPlannerTests(unittest.TestCase):
         self.assertFalse(plan["json_parse_success"])
         self.assertIn("planner_error", plan)
 
+    def test_current_market_query_does_not_keep_unrequested_past_years(self):
+        raw_plan = {
+            "is_research_task": True,
+            "main_topic": "AI Agent 市场现状",
+            "sub_queries": [
+                {
+                    "title": "主要公司",
+                    "query_zh": "AI Agent 主要公司 2024",
+                    "query_en": "AI Agent companies market 2023 2024",
+                    "purpose": "识别主要参与者",
+                },
+                {
+                    "title": "融资情况",
+                    "query_zh": "AI Agent 融资 2024",
+                    "query_en": "AI Agent funding rounds 2023 2024",
+                    "purpose": "了解融资活跃度",
+                },
+                {
+                    "title": "商业模式",
+                    "query_zh": "AI Agent 商业模式 2024",
+                    "query_en": "AI Agent business models 2024",
+                    "purpose": "分析商业模式",
+                },
+            ],
+        }
+
+        plan = query_planner.validate_plan(
+            raw_plan,
+            "帮我研究一下 AI Agent 市场现状，包括主要公司、融资情况、商业模式和未来趋势",
+            current_year=2026,
+        )
+        query_en = " ".join(
+            item["query_en"] for item in plan.get("sub_queries", [])
+        ).lower()
+
+        self.assertNotIn("2023", query_en)
+        self.assertNotIn("2024", query_en)
+        self.assertTrue(
+            any(marker in query_en for marker in ["current", "latest", "2026"])
+        )
+
     @patch("agent.plan_queries")
     @patch("agent.generate_report")
     @patch("agent.run_bilingual_search")
