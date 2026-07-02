@@ -109,7 +109,10 @@ class AgentSearchTests(unittest.TestCase):
         report = agent.summarize_search("今天 AI 新闻")
 
         self.assertEqual(report["english_query"], "latest AI news")
-        self.assertEqual(report["chinese"], "中文报告")
+        self.assertIn("# Research Report", report["chinese"])
+        self.assertIn("中文报告", report["chinese"])
+        self.assertIn("research_id", report)
+        self.assertIn("Research Metadata", report["chinese"])
         self.assertEqual(report["english"], agent.ENGLISH_REPORT_PLACEHOLDER)
         self.assertFalse(report["english_report_available"])
         self.assertEqual(report["source_stats"]["total_sources"], 2)

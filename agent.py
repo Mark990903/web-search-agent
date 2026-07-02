@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from citation_pipeline import process_report_citations
+from report_engine import create_research_report
 # 导入我们自己编写的多来源搜索工具
 # multi_source_search() 会同时调用 Tavily、Google、NewsAPI 等搜索来源
 from search_tool import merge_results, multi_source_search
@@ -393,6 +394,70 @@ def build_source_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def build_report_metadata(
+    *,
+    time_range: Any,
+    source_stats: dict[str, Any],
+    search_metadata: dict[str, Any],
+    planner_metadata: dict[str, Any],
+    search_duration: float,
+    language: str = "zh",
+) -> dict[str, Any]:
+    """Build V3.2 report metadata without changing search behavior."""
+    time_range_text = "None"
+    if time_range:
+        time_range_text = (
+            f"{time_range.label} "
+            f"({time_range.start_iso} to {time_range.end_iso})"
+        )
+
+    return {
+        "language": language,
+        "search_sources": search_metadata.get("enabled_sources", []),
+        "total_sources": source_stats.get("total_sources", 0),
+        "planner_enabled": bool(
+            planner_metadata.get("planner", {}).get("enabled")
+        ),
+        "time_range": time_range_text,
+        "search_duration": search_duration,
+    }
+
+
+def build_final_research_markdown(
+    *,
+    query: str,
+    raw_report: str,
+    planner_metadata: dict[str, Any],
+    sources: list[dict[str, Any]],
+    source_stats: dict[str, Any],
+    search_metadata: dict[str, Any],
+    time_range: Any,
+    search_duration: float,
+    language: str = "zh",
+) -> tuple[str, dict[str, Any]]:
+    """Render the V3.2 canonical report and run citation post-processing."""
+    metadata = build_report_metadata(
+        time_range=time_range,
+        source_stats=source_stats,
+        search_metadata=search_metadata,
+        planner_metadata=planner_metadata,
+        search_duration=search_duration,
+        language=language,
+    )
+    research_report = create_research_report(
+        title="Research Report",
+        query=query,
+        planner=planner_metadata.get("planner", {}),
+        report=raw_report,
+        sources=sources,
+        metadata=metadata,
+        language=language,
+    )
+    markdown = research_report.to_markdown()
+    processed_markdown = process_report_citations(markdown, sources)
+    return processed_markdown, research_report.metadata
+
+
 def build_error_response(
     query: str,
     english_query: str,
@@ -594,6 +659,7 @@ def summarize_search(query: str, use_planner: bool = True) -> dict[str, Any]:
         status metadata, source statistics, and final sources.
     """
 
+    workflow_start = time.perf_counter()
     logger.info("Query Planner enabled=%s", use_planner)
 
     time_range = detect_time_range(query)
@@ -675,11 +741,22 @@ def summarize_search(query: str, use_planner: bool = True) -> dict[str, Any]:
                 context=context,
                 time_range=time_range,
             )
-            chinese_report = process_report_citations(raw_chinese_report, results)
+            chinese_report, report_metadata = build_final_research_markdown(
+                query=query,
+                raw_report=raw_chinese_report,
+                planner_metadata=planner_metadata,
+                sources=results,
+                source_stats=source_stats,
+                search_metadata=search_metadata,
+                time_range=time_range,
+                search_duration=time.perf_counter() - workflow_start,
+                language="zh",
+            )
         except Exception as error:
             logger.error("LLM 调用失败：%s", error)
             report_errors.append(f"中文报告生成失败：{error}")
             chinese_report = f"OFOX 模型调用失败：{error}"
+            report_metadata = {}
 
         response = {
             "chinese": chinese_report,
@@ -689,6 +766,9 @@ def summarize_search(query: str, use_planner: bool = True) -> dict[str, Any]:
             "sources": results,
             "source_stats": source_stats,
             "english_report_available": False,
+            "research_report_markdown": chinese_report,
+            "report_metadata": report_metadata,
+            "research_id": report_metadata.get("research_id", ""),
             **search_metadata,
             **planner_metadata,
         }
@@ -769,11 +849,22 @@ def summarize_search(query: str, use_planner: bool = True) -> dict[str, Any]:
             report_language="zh",
             time_range=time_range,
         )
-        chinese_report = process_report_citations(raw_chinese_report, results)
+        chinese_report, report_metadata = build_final_research_markdown(
+            query=query,
+            raw_report=raw_chinese_report,
+            planner_metadata=planner_metadata,
+            sources=results,
+            source_stats=source_stats,
+            search_metadata=search_metadata,
+            time_range=time_range,
+            search_duration=time.perf_counter() - workflow_start,
+            language="zh",
+        )
     except Exception as error:
         logger.error("LLM 调用失败：%s", error)
         report_errors.append(f"中文报告生成失败：{error}")
         chinese_report = f"OFOX 模型调用失败：{error}"
+        report_metadata = {}
 
     english_report = ENGLISH_REPORT_PLACEHOLDER
 
@@ -788,6 +879,9 @@ def summarize_search(query: str, use_planner: bool = True) -> dict[str, Any]:
         "sources": results,
         "source_stats": source_stats,
         "english_report_available": False,
+        "research_report_markdown": chinese_report,
+        "report_metadata": report_metadata,
+        "research_id": report_metadata.get("research_id", ""),
         **search_metadata,
         **planner_metadata,
     }

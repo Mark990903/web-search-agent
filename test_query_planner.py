@@ -189,7 +189,8 @@ class QueryPlannerTests(unittest.TestCase):
 
         plan_queries.assert_not_called()
         self.assertFalse(report["planner"]["enabled"])
-        self.assertEqual(report["chinese"], "中文报告")
+        self.assertIn("# Research Report", report["chinese"])
+        self.assertIn("中文报告", report["chinese"])
 
     @patch("agent.plan_queries", side_effect=RuntimeError("planner boom"))
     @patch("agent.generate_report")
@@ -230,7 +231,8 @@ class QueryPlannerTests(unittest.TestCase):
         report = agent.summarize_search("今天 AI 新闻")
 
         plan_queries.assert_called_once()
-        self.assertEqual(report["chinese"], "中文报告")
+        self.assertIn("# Research Report", report["chinese"])
+        self.assertIn("中文报告", report["chinese"])
         self.assertIn("planner_error", report)
         self.assertEqual(report["sources"][0]["source_id"], 1)
         self.assertTrue(
